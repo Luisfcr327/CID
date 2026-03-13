@@ -1,0 +1,245 @@
+import pandas as pd     
+import pyodbc
+from datetime import date, timedelta
+import statistics
+import warnings
+import schedule
+import time
+
+class Tienda():
+    def __init__(self, tienda):
+        self.numero_tienda = tienda
+        self.socio = tienda[:2]
+        self.stock = 0,
+        self.promedio = 0,
+        self.consumo_diario = [0]
+
+
+    def agregar_stock(self,stock_agregado):
+        self.stock = self.stock + stock_agregado
+
+    def quitar_stock(self,stock_consumido):
+        self.consumo_diario.append(stock_consumido)
+        self.stock = self.stock - stock_consumido
+    
+    def ajustar_stock(self,nuevo_stock):
+        self.stock = nuevo_stock
+
+    def calcular_promedio(self):
+        self.promedio = statistics.mean(self.consumo_diario)
+
+    def get_stock(self):
+        return self.stock
+        
+    def get_numero_tienda(self):
+        return self.numero_tienda
+        
+    def get_socio(self):
+        return self.socio
+
+    def __str__(self):
+        return f"Tienda: {self.numero_tienda} \n Socio: {self.socio} \n Stock: {self.stock} \n "
+
+    def to_dict(self):
+        return {
+            "NumeroTienda": self.numero_tienda,
+            "Socio": self.socio,
+            "Stock" : self.stock,
+            "Consumo diario": ", ".join(map(str, self.consumo_diario)),
+            "Promedio diario" : self.promedio
+        }
+
+        
+#AQUI ESTA TODO LO DE LA BASE DE DATOS
+def abrir_db():
+#Conexion a la base de datos
+    server = "MP-VW-DB-017"
+    database = "Tarjeta_Digital"
+
+
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={server};"
+        f"DATABASE={database};"
+        f"Trusted_Connection=yes;"
+    )
+
+    try:
+        connection=pyodbc.connect(conn_str)
+        print("Conexion exitosa")
+    except Exception as e:
+            print("Error en la conexion: ",e)
+            
+    return connection
+                    
+def ejecutar_query(query,connection):
+    #Creamos el objeto cursor para poder ejecutar consultas
+    cursor = connection.cursor()
+
+    # Realizar las consultas y el resultado lo guardamos en otro dataframe
+    df = pd.read_sql(query, connection)
+        
+    return df
+    
+def cerrar_db(connection):
+    # Cerrar la conexión
+    connection.close()
+    
+    return connection
+
+
+#QUERY'S
+def query_bid(fecha_inicio, fecha_final):
+    
+    query = f"""
+    SELECT 
+        NumeroTienda,
+        COUNT(*) AS CantidadRegistros
+    FROM [Tarjeta_Digital].[dbo].[TD_Embozado]
+    WHERE fechaAct >= {fecha_inicio} 
+      AND fechaAct < {fecha_final}
+    GROUP BY NumeroTienda
+    ORDER BY CantidadRegistros DESC;    
+    """
+    return query
+
+#Aqui se desarrolla el control de inventario
+#Se van a definir todas las tiendas con todo su stock origen, para que esto funcione el codigo necesita estar siempre corriendo (usar una compu como servidor)
+def definir_tiendas():
+    tiendas = []
+    df_tiendas = pd.read_excel("Archivo_Origen_Tiendas.xlsx", dtype={"Tienda":str})
+
+    for index, row in df_tiendas.iterrows():
+        t = Tienda(row["Tienda"])
+        t.ajustar_stock(row["Stock"])
+        tiendas.append(t)
+
+    #Se transforma en diccionario el numero de tienda para que sea mas eficiente las operaciones, es {numero de tienda:tienda}
+    tiendas = {tienda.get_numero_tienda(): tienda for tienda in tiendas}
+
+    return tiendas
+
+def modificar_stock(columna_tienda, columna_plasticos, tiendas, metodo, df):
+
+    #Se implementa una busqueda de tienda para a esa agregarle, establecerle o quitarle el stock, si en el diccionario existe entonces a esa tienda se le aplica la operacion
+    for _, row in df.iterrows():    
+        tienda = tiendas.get(row[columna_tienda])
+        if tienda:
+            getattr(tienda, metodo)(row[columna_plasticos])
+            tienda.calcular_promedio()
+    
+    return tiendas   
+
+def bid():
+
+    fecha_hoy = "'" + date.today().strftime("%Y-%m-%d") + "'"
+    fecha_ant = "'" + (date.today() - timedelta(days=1)).strftime("%Y-%m-%d") + "'"
+    
+    conn = abrir_db()
+    df_bid = ejecutar_query(query_bid(fecha_ant, fecha_hoy), conn)
+    cerrar_db(conn)
+    
+    return df_bid
+
+
+def exportar_archivo(dic_tiendas, nombre):
+
+    data = [tienda.to_dict() for tienda in dic_tiendas.values()]
+    df = pd.DataFrame(data)
+    df.to_excel(nombre, index=False)
+
+def eliminacion_diaria(tiendas):
+
+    exportar_archivo(tiendas, "Respaldo.xlsx")
+    df_bid = bid()
+    tiendas = modificar_stock("NumeroTienda", "CantidadRegistros", tiendas, "quitar_stock", df_bid)
+    exportar_archivo(tiendas, "Tiendas.xlsx")
+
+    print("Stocks actualizados")
+    return tiendas
+
+def reportes(tiendas):
+    #Aqui se llamara a las funciones de los reportes 
+    opc = 0
+    while (opc!="5"):
+        print("Menu de reportes")
+        print("1-Reporte de Stock actual")
+        print("2-Reporte de embozado")
+        print("3-Reporte de Merma")
+        print("4-Reporte de consumo")
+        print("5-Salir")
+
+        opc = input("Seleccione el reporte deseado")
+
+        match opc:
+            case "1":
+                exportar_archivo(tiendas, "Reporte de Stock Actual.xlsx")
+                print("\nReporte exportado con exitp")
+            case "5":
+                return
+            case _:
+                print("Opción invalida")
+    
+
+def menu(tiendas):
+
+    
+    schedule.every().day.at("16:43").do(eliminacion_diaria, tiendas)
+    
+    opc = 0
+    while (opc!="4"):
+        print("Menu")
+        print("\n\t1-Agregar Stock")
+        print("\n\t2-Modificar Stock")
+        print("\n\t3-Eliminar Stock")
+        print("\n\t4-Reportes")
+        print("\n\t5-Salir")
+        
+    
+        opc = input("\nElige la opción deseada")
+
+        match opc:
+            case "1": 
+                exportar_archivo(tiendas, "Respaldo.xlsx")
+                df_archivo = pd.read_excel("Pruebas_agregar.xlsx", dtype = {"Numero de tienda":str})
+                tiendas = modificar_stock("Numero de tienda", "Plasticos distribuidos", tiendas, "agregar_stock", df_archivo)
+                print("\nStock modificado con exito")
+            case "2":
+                exportar_archivo(tiendas, "Respaldo.xlsx")
+                df_archivo = pd.read_excel("Pruebas_agregar.xlsx", dtype = {"Numero de tienda":str})
+                tiendas = modificar_stock("Numero de tienda", "Plasticos distribuidos", tiendas, "ajustar_stock", df_archivo)
+                print("\nStock modificado con exito")
+            case "3":
+                exportar_archivo(tiendas, "Respaldo.xlsx")
+                df_bid = bid()
+                tiendas = modificar_stock("NumeroTienda", "CantidadRegistros", tiendas, "quitar_stock", df_bid)
+                print("\nStock modificado con exito")
+            case "4":
+                reportes(tiendas)
+            case "5":
+                break
+            case _:
+                print("Opcion invalida")
+
+        #Cada dia se ejecutara a cierta hora la funcion de eliminar para que se eliminen automaticamente los registros, funciona si no se pausa el codigo
+        schedule.run_pending()
+        time.sleep(1)
+    
+
+
+            
+    
+
+def main():
+    
+    warnings.filterwarnings('ignore')
+    tiendas = definir_tiendas()
+    
+    menu(tiendas)
+
+
+    
+main()
+    
+
+
